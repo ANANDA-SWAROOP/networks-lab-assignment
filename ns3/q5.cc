@@ -1,101 +1,158 @@
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
-#include "ns3/csma-module.h"
 #include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
 #include "ns3/applications-module.h"
 #include "ns3/traffic-control-module.h"
 #include "ns3/flow-monitor-module.h"
-#include "ns3/netanim-module.h"
-using namespace ns3;
+#include <vector>
+#include <sstream>
 
-NS_LOG_COMPONENT_DEFINE("BusQueueManagement");
+using namespace ns3;
+NS_LOG_COMPONENT_DEFINE("BusTopologyWorking");
+
+static void AddIfNotPresent(NetDeviceContainer &c, Ptr<NetDevice> d)
+{
+  for (uint32_t i = 0; i < c.GetN(); ++i)
+    {
+      if (c.Get(i) == d) return;
+    }
+  c.Add(d);
+}
 
 int main(int argc, char *argv[])
 {
-    bool useRed = false;
-    CommandLine cmd(__FILE__);
-    cmd.AddValue("useRed", "Use RED queue instead of DropTail", useRed);
-    cmd.Parse(argc, argv);
+  std::string queueType = "DropTail";
+  double simTime = 10.0;
+  uint32_t numNodes = 10;
+  uint32_t queueSizePackets = 50;
+  uint32_t centralNode = numNodes / 2;
 
-    NodeContainer nodes;
-    nodes.Create(10);
+  CommandLine cmd;
+  cmd.AddValue("queueType", "Queue type: DropTail or RED", queueType);
+  cmd.AddValue("simTime", "Simulation time (s)", simTime);
+  cmd.AddValue("numNodes", "Number of nodes", numNodes);
+  cmd.AddValue("queueSize", "Queue size in packets", queueSizePackets);
+  cmd.AddValue("central", "Central node index (0..numNodes-1)", centralNode);
+  cmd.Parse(argc, argv);
 
-    CsmaHelper csma;
-    csma.SetChannelAttribute("DataRate", StringValue("10Mbps"));
-    csma.SetChannelAttribute("Delay", StringValue("2ms"));
+  if (numNodes < 3) NS_FATAL_ERROR("Need at least 3 nodes.");
 
-    NetDeviceContainer devices = csma.Install(nodes);
+  NodeContainer nodes;
+  nodes.Create(numNodes);
 
-    // Queue management setup
-    TrafficControlHelper tch;
-    if (useRed) {
-        tch.SetRootQueueDisc("ns3::RedQueueDisc");
-    } else {
-        tch.SetRootQueueDisc("ns3::DropTailQueueDisc");
-    }
-    QueueDiscContainer qdiscs = tch.Install(devices);
+  PointToPointHelper p2p;
+  p2p.SetDeviceAttribute("DataRate", StringValue("10Mbps"));
+  p2p.SetChannelAttribute("Delay", StringValue("2ms"));
 
-    InternetStackHelper stack;
-    stack.Install(nodes);
-
-    Ipv4AddressHelper address;
-    address.SetBase("10.1.1.0", "255.255.255.0");
-    Ipv4InterfaceContainer interfaces = address.Assign(devices);
-
-    // Setup OnOff traffic (each node sends to the last node)
-    uint16_t port = 9;
-    for (uint32_t i = 0; i < nodes.GetN() - 1; ++i) {
-        OnOffHelper onoff("ns3::UdpSocketFactory",
-                          InetSocketAddress(interfaces.GetAddress(9), port));
-        onoff.SetAttribute("DataRate", StringValue("1Mbps"));
-        onoff.SetAttribute("PacketSize", UintegerValue(1024));
-        onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
-        onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0.2]"));
-        ApplicationContainer app = onoff.Install(nodes.Get(i));
-        app.Start(Seconds(1.0 + i * 0.1));
-        app.Stop(Seconds(10.0));
+  std::vector<NetDeviceContainer> links;
+  links.reserve(numNodes - 1);
+  for (uint32_t i = 0; i < numNodes - 1; ++i)
+    {
+      links.push_back(p2p.Install(nodes.Get(i), nodes.Get(i + 1)));
     }
 
-    // Sink on node 9
-    PacketSinkHelper sink("ns3::UdpSocketFactory",
-                          InetSocketAddress(Ipv4Address::GetAny(), port));
-    ApplicationContainer sinkApp = sink.Install(nodes.Get(9));
-    sinkApp.Start(Seconds(0.0));
-    sinkApp.Stop(Seconds(11.0));
+  InternetStackHelper internet;
+  internet.Install(nodes);
 
-    // Flow monitor
-    FlowMonitorHelper flowmon;
-    Ptr<FlowMonitor> monitor = flowmon.InstallAll();
-
-    // NetAnim visualization
-    AnimationInterface anim("bus_queue_management.xml");
-    for (uint32_t i = 0; i < nodes.GetN(); ++i) {
-        anim.SetConstantPosition(nodes.Get(i), 10 * i, 20);
+  Ipv4AddressHelper address;
+  std::vector<Ipv4InterfaceContainer> ifs;
+  ifs.reserve(links.size());
+  for (uint32_t i = 0; i < links.size(); ++i)
+    {
+      std::ostringstream subnet;
+      subnet << "10.1." << (i + 1) << ".0";
+      address.SetBase(subnet.str().c_str(), "255.255.255.0");
+      ifs.push_back(address.Assign(links[i]));
     }
 
-    Simulator::Stop(Seconds(11.0));
-    Simulator::Run();
-
-    // Flow monitor results
-    monitor->CheckForLostPackets();
-    Ptr<Ipv4FlowClassifier> classifier =
-        DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
-    std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
-
-    uint32_t totalTx = 0, totalRx = 0;
-    for (auto &flow : stats) {
-        totalTx += flow.second.txPackets;
-        totalRx += flow.second.rxPackets;
+  TrafficControlHelper tch;
+  if (queueType == "RED")
+    {
+      NS_LOG_UNCOND("Using RED queue discipline");
+      tch.SetRootQueueDisc("ns3::RedQueueDisc",
+                           "MinTh", DoubleValue (5.0),
+                           "MaxTh", DoubleValue (15.0),
+                           "QueueLimit", UintegerValue(queueSizePackets));
+    }
+  else
+    {
+      NS_LOG_UNCOND("Using DropTail (FifoQueueDisc)");
+      std::string qsize = std::to_string(queueSizePackets) + "p";
+      tch.SetRootQueueDisc("ns3::FifoQueueDisc",
+                           "MaxSize", QueueSizeValue(QueueSize(qsize)));
     }
 
-    std::cout << "\n--- Queue Type: "
-              << (useRed ? "RED" : "DropTail") << " ---\n";
-    std::cout << "Total Packets Sent: " << totalTx << "\n";
-    std::cout << "Total Packets Received: " << totalRx << "\n";
-    std::cout << "Packets Dropped: " << (totalTx - totalRx) << "\n";
-    std::cout << "Packet Delivery Ratio: "
-              << (100.0 * totalRx / totalTx) << "%\n";
+  if (centralNode >= numNodes) centralNode = numNodes / 2;
+  NetDeviceContainer centralDevices;
+  if (centralNode > 0)
+    {
+      AddIfNotPresent(centralDevices, links[centralNode - 1].Get(1));
+    }
+  if (centralNode < links.size())
+    {
+      AddIfNotPresent(centralDevices, links[centralNode].Get(0));
+    }
 
-    Simulator::Destroy();
-    return 0;
+  if (centralDevices.GetN() == 0)
+    {
+      NS_FATAL_ERROR("No central devices found to install queue-disc.");
+    }
+
+  tch.Install(centralDevices);
+
+  uint16_t port = 9000;
+  Address sinkAddress = InetSocketAddress(ifs.back().GetAddress(1), port);
+
+  for (uint32_t i = 0; i < numNodes - 1; ++i)
+    {
+      OnOffHelper onoff("ns3::UdpSocketFactory", sinkAddress);
+      onoff.SetAttribute("DataRate", StringValue("2Mbps"));
+      onoff.SetAttribute("PacketSize", UintegerValue(1024));
+      onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
+      onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+      double start = 1.0 + i * 0.05;
+      onoff.SetAttribute("StartTime", TimeValue(Seconds(start)));
+      onoff.SetAttribute("StopTime", TimeValue(Seconds(simTime)));
+      onoff.Install(nodes.Get(i));
+    }
+
+  PacketSinkHelper sink("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), port));
+  ApplicationContainer sinkApp = sink.Install(nodes.Get(numNodes - 1));
+  sinkApp.Start(Seconds(0.0));
+  sinkApp.Stop(Seconds(simTime + 0.1));
+
+  FlowMonitorHelper flowmon;
+  Ptr<FlowMonitor> monitor = flowmon.InstallAll();
+
+  Simulator::Stop(Seconds(simTime + 0.1));
+  Simulator::Run();
+
+  std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
+  uint64_t totalLost = 0;
+  std::vector<double> throughputs;
+  for (auto &kv : stats)
+    {
+      const FlowMonitor::FlowStats &f = kv.second;
+      totalLost += f.lostPackets;
+      double rxBps = double(f.rxBytes) * 8.0 / simTime;
+      throughputs.push_back(rxBps);
+    }
+
+  double sum = 0.0, sumSq = 0.0;
+  for (double x : throughputs) { sum += x; sumSq += x * x; }
+  double fairness = 0.0;
+  if (!throughputs.empty() && sumSq > 0.0) fairness = (sum * sum) / (throughputs.size() * sumSq);
+
+  NS_LOG_UNCOND("========================================");
+  NS_LOG_UNCOND("Queue Type: " << queueType);
+  NS_LOG_UNCOND("Central node index: " << centralNode);
+  NS_LOG_UNCOND("Flows measured: " << throughputs.size());
+  NS_LOG_UNCOND("Total packets dropped (FlowMonitor lostPackets): " << totalLost);
+  NS_LOG_UNCOND("Jain's Fairness Index: " << fairness);
+  NS_LOG_UNCOND("Simulation time: " << simTime << " s");
+  NS_LOG_UNCOND("========================================");
+
+  Simulator::Destroy();
+  return 0;
 }
